@@ -18,6 +18,7 @@ class HaIntercomCard extends LitElement {
       .then((storedConfig) => {
         this.config = config;
         this.CLIENT_ID = storedConfig.clientId;
+        this._applyAudioOptions(this.config.audio || {});
         this.TARGETS = this.config.targets ? Array.isArray(this.config.targets) ? this.config.targets : [this.config.targets] : [];
         this.display = this.config.display && ['default', 'collapse', 'single'].indexOf(this.config.display.trim().toLowerCase()) > -1 ? this.config.display.trim().toLowerCase() : 'default';
         this.position = this.config.position && ['fixed', 'inline'].indexOf(this.config.position.trim().toLowerCase()) > -1 ? this.config.position.trim().toLowerCase() : 'fixed';
@@ -625,11 +626,26 @@ class HaIntercomCard extends LitElement {
     this.callEndedDelay = 10000;
     this.callStartTime = null;
     this.callDurationStr = '';
-    this.audioConfig = {
+    this.audioOptions = {
+      autoGain: true,
+      browserAutoGainControl: false,
       echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: false,
+      noiseSuppression: false,
+      targetRms: 0.08,
+      silenceRms: 0.006,
+      minGain: 0.8,
+      maxGain: 6.0,
+      debug: false,
     };
+    this.audioConfig = {};
+    this._applyAudioOptions({});
+    this._micAudioContext = null;
+    this._micAnalyser = null;
+    this._micGainNode = null;
+    this._micCompressor = null;
+    this._micAgcRaf = null;
+    this._rawMicTrack = null;
+    this._rawMicStream = null;
     this.videoConfig = {
       aspectRatio: 16 / 9
     };
@@ -678,6 +694,174 @@ class HaIntercomCard extends LitElement {
         }
       });
     }
+  }
+
+  _applyAudioOptions(options = {}) {
+    this.audioOptions = {
+      ...this.audioOptions,
+      ...options,
+    };
+    this.audioConfig = {
+      echoCancellation: this.audioOptions.echoCancellation,
+      noiseSuppression: this.audioOptions.noiseSuppression,
+      autoGainControl: this.audioOptions.browserAutoGainControl,
+    };
+  }
+
+  async _prepareLocalStream(stream) {
+    const audioTrack = stream?.getAudioTracks?.()[0];
+    if (!audioTrack || !this.audioOptions.autoGain) {
+      return stream;
+    }
+
+    const processedAudioTrack = await this._processMicTrack(audioTrack);
+    if (!processedAudioTrack || processedAudioTrack === audioTrack) {
+      return stream;
+    }
+
+    const processedStream = new MediaStream();
+    processedStream.addTrack(processedAudioTrack);
+    stream.getVideoTracks().forEach(track => processedStream.addTrack(track));
+    return processedStream;
+  }
+
+  async _processMicTrack(rawAudioTrack) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      console.warn("HA-Intercom: Web Audio API not available; using raw mic track");
+      return rawAudioTrack;
+    }
+
+    this._cleanupMicProcessing();
+
+    const audioContext = new AudioContextClass();
+    if (audioContext.state === 'suspended') {
+      try {
+        await audioContext.resume();
+      } catch (err) {
+        console.warn("HA-Intercom: failed to resume mic AudioContext; using raw mic track", err);
+        return rawAudioTrack;
+      }
+    }
+
+    const sourceStream = new MediaStream([rawAudioTrack]);
+    const source = audioContext.createMediaStreamSource(sourceStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.85;
+
+    const gain = audioContext.createGain();
+    gain.gain.value = 1.0;
+
+    let compressor = null;
+    if (audioContext.createDynamicsCompressor) {
+      compressor = audioContext.createDynamicsCompressor();
+      compressor.threshold.value = -18;
+      compressor.knee.value = 18;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
+    }
+
+    const destination = audioContext.createMediaStreamDestination();
+    source.connect(analyser);
+    analyser.connect(gain);
+    if (compressor) {
+      gain.connect(compressor);
+      compressor.connect(destination);
+    } else {
+      gain.connect(destination);
+    }
+
+    const processedAudioTrack = destination.stream.getAudioTracks()[0];
+    if (!processedAudioTrack) {
+      console.warn("HA-Intercom: no processed mic track created; using raw mic track");
+      this._cleanupMicProcessing();
+      return rawAudioTrack;
+    }
+
+    this._micAudioContext = audioContext;
+    this._micAnalyser = analyser;
+    this._micGainNode = gain;
+    this._micCompressor = compressor;
+    this._rawMicTrack = rawAudioTrack;
+    this._rawMicStream = sourceStream;
+    this._startMicAgc();
+
+    if (this.audioOptions.debug) {
+      console.debug("HA-Intercom mic settings", rawAudioTrack.getSettings?.());
+    }
+
+    return processedAudioTrack;
+  }
+
+  _startMicAgc() {
+    if (!this._micAnalyser || !this._micGainNode || !this._micAudioContext) {
+      return;
+    }
+
+    const analyser = this._micAnalyser;
+    const gainNode = this._micGainNode;
+    const audioContext = this._micAudioContext;
+    const samples = new Float32Array(analyser.fftSize);
+    let currentGain = gainNode.gain.value || 1.0;
+    let lastDebug = 0;
+
+    const tick = () => {
+      if (!this._micAnalyser || !this._micGainNode) {
+        return;
+      }
+
+      analyser.getFloatTimeDomainData(samples);
+      let sumSquares = 0;
+      for (const sample of samples) {
+        sumSquares += sample * sample;
+      }
+
+      const rms = Math.sqrt(sumSquares / samples.length);
+      let desiredGain = currentGain;
+
+      if (rms < this.audioOptions.silenceRms) {
+        desiredGain = Math.max(this.audioOptions.minGain, currentGain * 0.995);
+      } else {
+        desiredGain = this.audioOptions.targetRms / rms;
+        desiredGain = Math.min(this.audioOptions.maxGain, Math.max(this.audioOptions.minGain, desiredGain));
+      }
+
+      const smoothing = desiredGain > currentGain ? 0.18 : 0.08;
+      currentGain = currentGain + ((desiredGain - currentGain) * smoothing);
+      gainNode.gain.setTargetAtTime(currentGain, audioContext.currentTime, 0.05);
+
+      if (this.audioOptions.debug && performance.now() - lastDebug > 1000) {
+        console.debug("HA-Intercom mic AGC", { rms, gain: currentGain, desiredGain });
+        lastDebug = performance.now();
+      }
+
+      this._micAgcRaf = requestAnimationFrame(tick);
+    };
+
+    this._micAgcRaf = requestAnimationFrame(tick);
+  }
+
+  _cleanupMicProcessing() {
+    if (this._micAgcRaf) {
+      cancelAnimationFrame(this._micAgcRaf);
+      this._micAgcRaf = null;
+    }
+    if (this._rawMicTrack) {
+      this._rawMicTrack.stop();
+    }
+    if (this._micAudioContext) {
+      this._micAudioContext.close().catch(err => {
+        console.warn("HA-Intercom: failed to close mic AudioContext", err);
+      });
+    }
+    this._micAudioContext = null;
+    this._micAnalyser = null;
+    this._micGainNode = null;
+    this._micCompressor = null;
+    this._rawMicTrack = null;
+    this._rawMicStream = null;
   }
 
   syncToLiveEdge(element) {
@@ -864,14 +1048,20 @@ class HaIntercomCard extends LitElement {
     this.callStartTime = Date.now();
 
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig, video: type === 'video' ? this.videoConfig : false });
+      this._cleanupMicProcessing();
+      this.localStream = await this._prepareLocalStream(
+        await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig, video: type === 'video' ? this.videoConfig : false })
+      );
       this.outgoingVideoElement.srcObject = this.localStream;
       this._safePlay(this.outgoingVideoElement);
       this.outgoingMedia = { type, to: targets[0] };
     } catch (err) {
       console.warn(`Failed to get one or more media devices: ${err}`);
       try {
-        this.localStream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig });
+        this._cleanupMicProcessing();
+        this.localStream = await this._prepareLocalStream(
+          await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig })
+        );
         this.outgoingMedia = { type: 'audio', to: targets[0] };
         targets = targets.map(target => ({ ...target, type: 'audio' })); //force target to be audio since video failed
       } catch (audioErr) {
@@ -909,7 +1099,10 @@ class HaIntercomCard extends LitElement {
     this.roomState = 'in-call';
     this.callStartTime = Date.now();
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig, video: type === 'video' ? this.videoConfig : false });
+      this._cleanupMicProcessing();
+      this.localStream = await this._prepareLocalStream(
+        await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig, video: type === 'video' ? this.videoConfig : false })
+      );
       this.outgoingVideoElement.srcObject = this.localStream;
       this._safePlay(this.outgoingVideoElement);
       this.outgoingMedia = { type, to: this.incomingMedia?.from };
@@ -917,7 +1110,10 @@ class HaIntercomCard extends LitElement {
       console.warn(`Failed to get one or more media devices: ${err}`);
       try {
         // fallback to just Audio
-        this.localStream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig });
+        this._cleanupMicProcessing();
+        this.localStream = await this._prepareLocalStream(
+          await navigator.mediaDevices.getUserMedia({ audio: this.audioConfig })
+        );
         this.outgoingMedia = { type: 'audio', to: this.incomingMedia?.from };
       } catch (audioErr) {
         console.error(`No media devices available or permissions denied: ${audioErr}`);
@@ -1051,6 +1247,7 @@ class HaIntercomCard extends LitElement {
     if (this.localStream) {
       this.localStream.getTracks().forEach(t => t.stop());
     }
+    this._cleanupMicProcessing();
 
     // Close transports
     if (this.sendTransport) {

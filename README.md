@@ -103,6 +103,24 @@ with category **Integration**.
     - boolean
     - default: false
     - hide the 'interact' button on the bottom right that ensures user has interacted with the screen in order to recieve incoming calls
+- audio
+    - object
+    - optional microphone processing settings for browser clients
+    - defaults keep `echoCancellation` enabled, disable browser-only `autoGainControl`, and apply a Web Audio automatic gain stage before sending the mic track
+
+```yaml
+type: custom:ha-intercom-card
+clientId: kitchen_tablet
+audio:
+  autoGain: true
+  echoCancellation: true
+  noiseSuppression: false
+  browserAutoGainControl: false
+  targetRms: 0.08
+  minGain: 0.8
+  maxGain: 6
+  debug: false
+```
 
 ### Client Configuration
 
