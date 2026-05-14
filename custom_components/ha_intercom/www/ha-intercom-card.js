@@ -35,6 +35,7 @@ class HaIntercomCard extends LitElement {
   set hass(hass) {
     this._hass = hass;
     this._subscribeIntercomEventBridge();
+    this._recoverIntercomCallRequestFromState();
   }
 
   static get properties() {
@@ -595,6 +596,9 @@ class HaIntercomCard extends LitElement {
     this.connectTimeout = 5000;
     this.pingInterval = 30000;
     this.isManuallyClosed = false;
+    this._pendingIntercomCallRequest = null;
+    this._pendingIntercomCallTimer = null;
+    this._intercomActiveSessionSeen = null;
     this.audioElement = document.createElement('audio');
     this.incomingVideoElement = document.createElement('video');
     this.incomingVideoElement.autoplay = true;
@@ -918,6 +922,8 @@ class HaIntercomCard extends LitElement {
   disconnectedCallback() {
     super.disconnectedCallback();
     if (this.activationInterval) clearInterval(this.activationInterval);
+    if (this._pendingIntercomCallTimer) clearTimeout(this._pendingIntercomCallTimer);
+    this._pendingIntercomCallTimer = null;
     this._stopPlaybackMonitoring();
     this._unsubscribeIntercomEventBridge();
   }
@@ -1006,6 +1012,143 @@ class HaIntercomCard extends LitElement {
     return this.CLIENTS || [];
   }
 
+  _getEndpointRegistry() {
+    return this._hass?.states?.["sensor.intercom_endpoint_registry"]?.attributes?.endpoints || {};
+  }
+
+  _buildCallRequestFromActiveSession() {
+    const state = this._hass?.states?.["input_text.intercom_active_session"]?.state;
+    if (!state || state === "unknown" || state === "unavailable" || state === this._intercomActiveSessionSeen) {
+      return null;
+    }
+
+    const match = state.match(/^(\S+)\s*->\s*(\S+)\s+(\S+)\s+(\S+)\s+(.+)$/);
+    if (!match) {
+      return null;
+    }
+
+    const [, source, target, mode, media, timestamp] = match;
+    const startedAt = Date.parse(timestamp);
+    const maxAgeMs = Number(this.config?.intercomEventBridgeRecoverMs || 60000);
+    if (!Number.isFinite(startedAt) || Date.now() - startedAt > maxAgeMs) {
+      this._intercomActiveSessionSeen = state;
+      return null;
+    }
+
+    const endpoints = this._getEndpointRegistry();
+    const sourceEndpoint = endpoints[source];
+    const targetEndpoint = endpoints[target];
+    if (!sourceEndpoint?.ha_intercom_client || !targetEndpoint?.ha_intercom_client) {
+      return null;
+    }
+
+    this._intercomActiveSessionSeen = state;
+    return {
+      source,
+      source_client: sourceEndpoint.ha_intercom_client,
+      target,
+      target_client: targetEndpoint.ha_intercom_client,
+      media,
+      mode,
+      session_id: `${source}-${target}-${Math.floor(startedAt / 1000)}`,
+      recovered: true,
+    };
+  }
+
+  _recoverIntercomCallRequestFromState() {
+    if (this.config?.intercomEventBridge !== true) {
+      return;
+    }
+
+    const data = this._buildCallRequestFromActiveSession();
+    if (data) {
+      this._eventBridgeDebug("recovered active call request from HA state", data);
+      this._queueIntercomCallRequest(data, "active_session");
+    }
+  }
+
+  _queueIntercomCallRequest(data, reason = "event") {
+    const localIds = this._getLocalIdentityCandidates();
+    if (!localIds.includes(this._norm(data.source_client))) {
+      this._eventBridgeDebug("call request ignored by non-source client", { data, localIds });
+      return;
+    }
+
+    const key = data.session_id || `${data.source_client}->${data.target_client}`;
+    const existingKey = this._pendingIntercomCallRequest?.key;
+    this._pendingIntercomCallRequest = {
+      key,
+      data,
+      reason,
+      startedAt: this._pendingIntercomCallRequest && existingKey === key
+        ? this._pendingIntercomCallRequest.startedAt
+        : Date.now(),
+      attempts: this._pendingIntercomCallRequest && existingKey === key
+        ? this._pendingIntercomCallRequest.attempts
+        : 0,
+    };
+    this._attemptPendingIntercomCallRequest();
+  }
+
+  _schedulePendingIntercomCallRetry(reason) {
+    if (this._pendingIntercomCallTimer) {
+      return;
+    }
+
+    this._pendingIntercomCallTimer = setTimeout(() => {
+      this._pendingIntercomCallTimer = null;
+      this._attemptPendingIntercomCallRequest(reason);
+    }, Number(this.config?.intercomEventBridgeRetryMs || 500));
+  }
+
+  async _attemptPendingIntercomCallRequest(reason = "retry") {
+    const pending = this._pendingIntercomCallRequest;
+    if (!pending) {
+      return;
+    }
+
+    const maxWaitMs = Number(this.config?.intercomEventBridgeMaxWaitMs || 20000);
+    if (Date.now() - pending.startedAt > maxWaitMs) {
+      console.warn("HA-Intercom event bridge: call request expired before client was ready", pending.data);
+      this._pendingIntercomCallRequest = null;
+      return;
+    }
+
+    if (this.socket?.readyState !== WebSocket.OPEN) {
+      this._eventBridgeDebug("waiting for signaling socket", { reason, data: pending.data });
+      this._schedulePendingIntercomCallRetry("socket");
+      return;
+    }
+
+    const clients = this._getKnownClients();
+    const target = clients.find((client) => this._clientMatches(client, pending.data.target_client));
+    if (!target) {
+      pending.attempts += 1;
+      this._eventBridgeDebug("waiting for target client", {
+        reason,
+        targetClient: pending.data.target_client,
+        clients,
+        attempts: pending.attempts,
+      });
+      this._schedulePendingIntercomCallRetry("target");
+      return;
+    }
+
+    this._pendingIntercomCallRequest = null;
+    console.log("HA-Intercom event bridge: starting call", {
+      sourceClient: pending.data.source_client,
+      targetClient: pending.data.target_client,
+      media: pending.data.media || "audio",
+      target,
+    });
+
+    try {
+      await this.startClientCall(target, pending.data.media || "audio");
+    } catch (err) {
+      console.error("HA-Intercom event bridge: startClientCall failed", err, pending.data);
+    }
+  }
+
   async _handleHaIntercomCallRequest(event) {
     const data = event?.data || {};
     const sourceClient = data.source_client;
@@ -1019,35 +1162,7 @@ class HaIntercomCard extends LitElement {
       return;
     }
 
-    const localIds = this._getLocalIdentityCandidates();
-    if (!localIds.includes(this._norm(sourceClient))) {
-      return;
-    }
-
-    const clients = this._getKnownClients();
-    const target = clients.find((client) => this._clientMatches(client, targetClient));
-    if (!target) {
-      console.warn("HA-Intercom event bridge: target client not found", {
-        targetClient,
-        localIds,
-        clients,
-        data,
-      });
-      return;
-    }
-
-    console.log("HA-Intercom event bridge: starting call", {
-      sourceClient,
-      targetClient,
-      media,
-      target,
-    });
-
-    try {
-      await this.startClientCall(target, media);
-    } catch (err) {
-      console.error("HA-Intercom event bridge: startClientCall failed", err, data);
-    }
+    this._queueIntercomCallRequest({ ...data, media }, "event");
   }
 
   _handleHaIntercomHangupRequest(event) {
@@ -1089,6 +1204,7 @@ class HaIntercomCard extends LitElement {
       console.log('HA-Intercom: WebSocket connected');
       this.sendMessage({ ...this.config, type: 'register' });
       this.startPing();
+      this._attemptPendingIntercomCallRequest("socket_open");
     };
 
     this.socket.onerror = (err) => {
@@ -1119,6 +1235,7 @@ class HaIntercomCard extends LitElement {
         case 'clients':
           let { clients } = msg;
           this.CLIENTS = clients;
+          this._attemptPendingIntercomCallRequest("clients");
           break;
         case 'config':
           break;
@@ -1931,4 +2048,6 @@ class HaIntercomCard extends LitElement {
 
 }
 
-customElements.define('ha-intercom-card', HaIntercomCard);
+if (!customElements.get('ha-intercom-card')) {
+  customElements.define('ha-intercom-card', HaIntercomCard);
+}
