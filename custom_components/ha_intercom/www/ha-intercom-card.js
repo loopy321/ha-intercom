@@ -20,6 +20,7 @@ class HaIntercomCard extends LitElement {
         this.CLIENT_ID = storedConfig.clientId;
         this._applyAudioOptions(this.config.audio || {});
         this._subscribeIntercomEventBridge();
+        this._recoverIntercomCallRequestFromState();
         this.TARGETS = this.config.targets ? Array.isArray(this.config.targets) ? this.config.targets : [this.config.targets] : [];
         this.display = this.config.display && ['default', 'collapse', 'single'].indexOf(this.config.display.trim().toLowerCase()) > -1 ? this.config.display.trim().toLowerCase() : 'default';
         this.position = this.config.position && ['fixed', 'inline'].indexOf(this.config.position.trim().toLowerCase()) > -1 ? this.config.position.trim().toLowerCase() : 'fixed';
@@ -1028,7 +1029,7 @@ class HaIntercomCard extends LitElement {
     }
 
     const [, source, target, mode, media, timestamp] = match;
-    const startedAt = Date.parse(timestamp);
+    const startedAt = Date.parse(timestamp.replace(/(\.\d{3})\d+/, "$1"));
     const maxAgeMs = Number(this.config?.intercomEventBridgeRecoverMs || 60000);
     if (!Number.isFinite(startedAt) || Date.now() - startedAt > maxAgeMs) {
       this._intercomActiveSessionSeen = state;
