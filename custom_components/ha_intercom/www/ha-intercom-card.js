@@ -19,6 +19,7 @@ class HaIntercomCard extends LitElement {
         this.config = config;
         this.CLIENT_ID = storedConfig.clientId;
         this._applyAudioOptions(this.config.audio || {});
+        this._subscribeIntercomEventBridge();
         this.TARGETS = this.config.targets ? Array.isArray(this.config.targets) ? this.config.targets : [this.config.targets] : [];
         this.display = this.config.display && ['default', 'collapse', 'single'].indexOf(this.config.display.trim().toLowerCase()) > -1 ? this.config.display.trim().toLowerCase() : 'default';
         this.position = this.config.position && ['fixed', 'inline'].indexOf(this.config.position.trim().toLowerCase()) > -1 ? this.config.position.trim().toLowerCase() : 'fixed';
@@ -33,6 +34,7 @@ class HaIntercomCard extends LitElement {
 
   set hass(hass) {
     this._hass = hass;
+    this._subscribeIntercomEventBridge();
   }
 
   static get properties() {
@@ -646,6 +648,9 @@ class HaIntercomCard extends LitElement {
     this._micAgcRaf = null;
     this._rawMicTrack = null;
     this._rawMicStream = null;
+    this._intercomSubscribed = false;
+    this._unsubCallRequest = null;
+    this._unsubHangupRequest = null;
     this.videoConfig = {
       aspectRatio: 16 / 9
     };
@@ -914,6 +919,156 @@ class HaIntercomCard extends LitElement {
     super.disconnectedCallback();
     if (this.activationInterval) clearInterval(this.activationInterval);
     this._stopPlaybackMonitoring();
+    this._unsubscribeIntercomEventBridge();
+  }
+
+  _subscribeIntercomEventBridge() {
+    if (this._intercomSubscribed || this.config?.intercomEventBridge !== true || !this._hass?.connection) {
+      return;
+    }
+
+    this._intercomSubscribed = true;
+    this._hass.connection.subscribeEvents(
+      (event) => this._handleHaIntercomCallRequest(event),
+      "ha_intercom_call_request",
+    ).then((unsub) => {
+      this._unsubCallRequest = unsub;
+    }).catch((err) => {
+      this._intercomSubscribed = false;
+      console.error("HA-Intercom event bridge: failed to subscribe to call requests", err);
+    });
+
+    this._hass.connection.subscribeEvents(
+      (event) => this._handleHaIntercomHangupRequest(event),
+      "ha_intercom_hangup_request",
+    ).then((unsub) => {
+      this._unsubHangupRequest = unsub;
+    }).catch((err) => {
+      this._intercomSubscribed = false;
+      console.error("HA-Intercom event bridge: failed to subscribe to hangup requests", err);
+    });
+
+    this._eventBridgeDebug("subscribed", {
+      localIds: this._getLocalIdentityCandidates(),
+      clients: this._getKnownClients(),
+    });
+  }
+
+  _unsubscribeIntercomEventBridge() {
+    try {
+      this._unsubCallRequest?.();
+      this._unsubHangupRequest?.();
+    } catch (err) {
+      console.warn("HA-Intercom event bridge: failed to unsubscribe", err);
+    }
+    this._unsubCallRequest = null;
+    this._unsubHangupRequest = null;
+    this._intercomSubscribed = false;
+  }
+
+  _eventBridgeDebug(message, data = {}) {
+    if (this.config?.intercomEventBridgeDebug === true) {
+      console.debug(`HA-Intercom event bridge: ${message}`, data);
+    }
+  }
+
+  _norm(value) {
+    return String(value ?? "").trim().toLowerCase();
+  }
+
+  _getLocalIdentityCandidates() {
+    return [
+      this.CLIENT_ID,
+      this.ENTITY_ID,
+      this.NAME,
+      this.config?.clientId,
+      this.config?.entity_id,
+      this.config?.name,
+    ].filter(Boolean).map((value) => this._norm(value));
+  }
+
+  _clientMatches(client, requested) {
+    const requestedNorm = this._norm(requested);
+    const candidates = [
+      client?.clientId,
+      client?.client_id,
+      client?.entity_id,
+      client?.entityId,
+      client?.name,
+      client?.NAME,
+      client?.id,
+    ].filter(Boolean).map((value) => this._norm(value));
+
+    return candidates.includes(requestedNorm);
+  }
+
+  _getKnownClients() {
+    return this.CLIENTS || [];
+  }
+
+  async _handleHaIntercomCallRequest(event) {
+    const data = event?.data || {};
+    const sourceClient = data.source_client;
+    const targetClient = data.target_client;
+    const media = data.media || "audio";
+
+    this._eventBridgeDebug("call request received", data);
+
+    if (!sourceClient || !targetClient) {
+      console.warn("HA-Intercom event bridge: missing source_client/target_client", data);
+      return;
+    }
+
+    const localIds = this._getLocalIdentityCandidates();
+    if (!localIds.includes(this._norm(sourceClient))) {
+      return;
+    }
+
+    const clients = this._getKnownClients();
+    const target = clients.find((client) => this._clientMatches(client, targetClient));
+    if (!target) {
+      console.warn("HA-Intercom event bridge: target client not found", {
+        targetClient,
+        localIds,
+        clients,
+        data,
+      });
+      return;
+    }
+
+    console.log("HA-Intercom event bridge: starting call", {
+      sourceClient,
+      targetClient,
+      media,
+      target,
+    });
+
+    try {
+      await this.startClientCall(target, media);
+    } catch (err) {
+      console.error("HA-Intercom event bridge: startClientCall failed", err, data);
+    }
+  }
+
+  _handleHaIntercomHangupRequest(event) {
+    const data = event?.data || {};
+    const localIds = this._getLocalIdentityCandidates();
+    const addressed = [data.source_client, data.target_client]
+      .filter(Boolean)
+      .map((value) => this._norm(value));
+    const shouldHangup = addressed.length === 0 || addressed.some((id) => localIds.includes(id));
+
+    this._eventBridgeDebug("hangup request received", { data, addressed, localIds, shouldHangup });
+
+    if (!shouldHangup) {
+      return;
+    }
+
+    try {
+      this.hangUp();
+    } catch (err) {
+      console.error("HA-Intercom event bridge: hangUp failed", err, data);
+    }
   }
 
   async connectSignaling() {

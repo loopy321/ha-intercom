@@ -107,10 +107,19 @@ with category **Integration**.
     - object
     - optional microphone processing settings for browser clients
     - defaults keep `echoCancellation` enabled, disable browser-only `autoGainControl`, and apply a Web Audio automatic gain stage before sending the mic track
+- intercomEventBridge
+    - boolean
+    - default: false
+    - subscribe to Home Assistant `ha_intercom_call_request` and `ha_intercom_hangup_request` events so an orchestration script can ask the source browser to start or end a call
+- intercomEventBridgeDebug
+    - boolean
+    - default: false
+    - log local identity candidates, HA events, and target matching diagnostics for the event bridge
 
 ```yaml
 type: custom:ha-intercom-card
 clientId: kitchen_tablet
+intercomEventBridge: true
 audio:
   autoGain: true
   echoCancellation: true
