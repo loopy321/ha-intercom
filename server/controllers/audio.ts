@@ -8,6 +8,11 @@ const getEntitiesByType = (entities, type) => {
     return entities.filter(item => item.type.toLowerCase().trim() === type);
 };
 
+const isBrowserClientEntity = (entity_id = '') => {
+    const normalized = entity_id.trim();
+    return normalized.startsWith('ha_client') || normalized.startsWith('ha_intercom.');
+};
+
 export const setPlayers = (room: RoomState) => {
     room.targets
     .filter(item => !!item?.entity_id)
@@ -28,7 +33,7 @@ export const setPlayers = (room: RoomState) => {
 
 export const startAudio = (room: RoomState, sdpString: string) => { 
 
-    const audioClients = room.entities.audio.filter(item => !item.entity_id.startsWith('ha_client'));
+    const audioClients = room.entities.audio.filter(item => !isBrowserClientEntity(item.entity_id));
 
     if(!audioClients.length) {
         return null;

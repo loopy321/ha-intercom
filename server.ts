@@ -115,6 +115,14 @@ const handleConnection = (ws: WebSocket, request) => {
     });
   };
 
+  const getRoom = (roomId: string | undefined, action: string) => {
+    if (!roomId || !rooms.has(roomId)) {
+      console.warn(`Ignoring ${action} for missing room: ${roomId || 'not set'}`);
+      return null;
+    }
+    return rooms.get(roomId)!;
+  };
+
   const setClientConfig = (clientConfig) => {
     (ws as any).client = clientConfig;
     ws.send(JSON.stringify({ type: 'updateConfig', ...clientConfig }));
@@ -135,7 +143,8 @@ const handleConnection = (ws: WebSocket, request) => {
     const { type, name, entity_id, targets, roomId, kind, producerId, dtlsParameters, rtpCapabilities, rtpParameters, consumerId } = msg;
 
     const joinRoom = (roomId, isInitiator = false) => {
-      const room = rooms.get(roomId!)!
+      const room = getRoom(roomId, 'join');
+      if (!room) return null;
       const clientData = {
         ws: ws,
         transports: new Map(),
@@ -167,6 +176,7 @@ const handleConnection = (ws: WebSocket, request) => {
           });
         }
         const room = joinRoom(roomId, true);
+        if (!room) break;
         ws.send(JSON.stringify({
           type: 'roomCreated',
           roomId: room.id,
@@ -186,6 +196,10 @@ const handleConnection = (ws: WebSocket, request) => {
       }
       case 'join': {
         const room = joinRoom(roomId, false);
+        if (!room) {
+          ws.send(JSON.stringify({ type: 'roomClosed', roomId }));
+          break;
+        }
         ws.send(JSON.stringify({
           type: 'roomJoined',
           roomId: room.id,
@@ -210,7 +224,10 @@ const handleConnection = (ws: WebSocket, request) => {
         break;
       }
       case 'createTransport': {
-        const room = rooms.get(roomId!)!;
+        const room = getRoom(roomId, 'createTransport');
+        if (!room) break;
+        const client = room.clients.get(userId);
+        if (!client) break;
         const transport = await room.router.createWebRtcTransport({
           listenInfos: [
             { protocol: 'udp', ip: '0.0.0.0', announcedAddress: ANNOUNCED_IP },
@@ -220,7 +237,7 @@ const handleConnection = (ws: WebSocket, request) => {
           enableTcp: true
         });
 
-        room.clients.get(userId)!.transports.set(transport.id, transport);
+        client.transports.set(transport.id, transport);
 
         ws.send(JSON.stringify({
           type: 'transportCreated',
@@ -237,8 +254,10 @@ const handleConnection = (ws: WebSocket, request) => {
       }
 
       case 'connectTransport': {
-        const room = rooms.get(roomId!)!;
-        const client = room.clients.get(userId)!;
+        const room = getRoom(roomId, 'connectTransport');
+        if (!room) break;
+        const client = room.clients.get(userId);
+        if (!client) break;
         const transport = client.transports.get(msg.transportId);
         if (transport) {
           await transport.connect({ dtlsParameters });
@@ -248,8 +267,10 @@ const handleConnection = (ws: WebSocket, request) => {
       }
 
       case 'produce': {
-        const room = rooms.get(roomId!)!;
-        const client = room.clients.get(userId)!;
+        const room = getRoom(roomId, 'produce');
+        if (!room) break;
+        const client = room.clients.get(userId);
+        if (!client) break;
         client.mediaType = msg.mediaType;
         const transport = client.transports.get(msg.transportId);
         if (!transport) return;
@@ -274,8 +295,10 @@ const handleConnection = (ws: WebSocket, request) => {
       }
 
       case 'consume': {
-        const room = rooms.get(roomId!)!;
-        const client = room.clients.get(userId)!;
+        const room = getRoom(roomId, 'consume');
+        if (!room) break;
+        const client = room.clients.get(userId);
+        if (!client) break;
         if (!room.router.canConsume({ producerId, rtpCapabilities })) return;
 
         // If transportId is provided use it, otherwise fallback
@@ -303,8 +326,10 @@ const handleConnection = (ws: WebSocket, request) => {
       }
 
       case 'resumeConsumer': {
-        const room = rooms.get(roomId!)!;
-        const client = room.clients.get(userId)!;
+        const room = getRoom(roomId, 'resumeConsumer');
+        if (!room) break;
+        const client = room.clients.get(userId);
+        if (!client) break;
         const consumer = client.consumers.get(consumerId);
         if (consumer) await consumer.resume();
         break;

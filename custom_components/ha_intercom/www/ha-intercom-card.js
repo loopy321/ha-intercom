@@ -18,6 +18,7 @@ class HaIntercomCard extends LitElement {
       .then((storedConfig) => {
         this.config = config;
         this.CLIENT_ID = storedConfig.clientId;
+        this._applyConfiguredClientIdentity(false);
         this._applyAudioOptions(this.config.audio || {});
         this._subscribeIntercomEventBridge();
         this._recoverIntercomCallRequestFromState();
@@ -600,6 +601,8 @@ class HaIntercomCard extends LitElement {
     this._pendingIntercomCallRequest = null;
     this._pendingIntercomCallTimer = null;
     this._intercomActiveSessionSeen = null;
+    this._activeIntercomSession = null;
+    this._callEndedEventFiredForKey = null;
     this.audioElement = document.createElement('audio');
     this.incomingVideoElement = document.createElement('video');
     this.incomingVideoElement.autoplay = true;
@@ -922,6 +925,9 @@ class HaIntercomCard extends LitElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    if (this.roomState === 'in-call' || this.roomId) {
+      this._fireHaIntercomCallEnded('disconnected');
+    }
     if (this.activationInterval) clearInterval(this.activationInterval);
     if (this._pendingIntercomCallTimer) clearTimeout(this._pendingIntercomCallTimer);
     this._pendingIntercomCallTimer = null;
@@ -1144,7 +1150,7 @@ class HaIntercomCard extends LitElement {
     });
 
     try {
-      await this.startClientCall(target, pending.data.media || "audio");
+      await this.startClientCall(target, pending.data.media || "audio", pending.data);
     } catch (err) {
       console.error("HA-Intercom event bridge: startClientCall failed", err, pending.data);
     }
@@ -1181,7 +1187,7 @@ class HaIntercomCard extends LitElement {
     }
 
     try {
-      this.hangUp();
+      this.hangUp('ha_hangup_request');
     } catch (err) {
       console.error("HA-Intercom event bridge: hangUp failed", err, data);
     }
@@ -1204,6 +1210,7 @@ class HaIntercomCard extends LitElement {
       clearTimeout(this.connectTimer);
       console.log('HA-Intercom: WebSocket connected');
       this.sendMessage({ ...this.config, type: 'register' });
+      this._applyConfiguredClientIdentity(true);
       this.startPing();
       this._attemptPendingIntercomCallRequest("socket_open");
     };
@@ -1225,7 +1232,9 @@ class HaIntercomCard extends LitElement {
       const msg = JSON.parse(event.data);
       switch (msg.type) {
         case 'setup':
-          this.displaySetup = true;
+          if (!this._applyConfiguredClientIdentity(true)) {
+            this.displaySetup = true;
+          }
           break;
         case 'updateConfig':
           let { name, entity_id } = msg;
@@ -1263,7 +1272,7 @@ class HaIntercomCard extends LitElement {
           break;
         case 'roomClosed':
           this.showCallEndedScreen();
-          this.hangUp();
+          this.hangUp('room_closed', { sendHangup: false, roomId: msg.roomId });
           break;
         case 'newProducer':
           if (!this.incomingMedia && this.roomState === 'in-call' && msg.from) {
@@ -1306,19 +1315,26 @@ class HaIntercomCard extends LitElement {
     }
   }
 
-  async startClientCall(client, type = 'audio') {
+  async startClientCall(client, type = 'audio', sessionData = {}) {
     this.clearCallEndedScreen();
     let targets = [{ ...client, type }];
-    return this.startCall(targets, type);
+    return this.startCall(targets, type, sessionData);
   }
 
-  async startCall(targets, type = 'audio') {
+  async startCall(targets, type = 'audio', sessionData = {}) {
     this.toggleMenu(false);
     const prefix = this.config?.room_prefix || 'ha-room';
     this.roomId = `${prefix}-${Math.random().toString(36).substring(7)}`;
     this.roomState = 'in-call';
     this.mediaType = type;
     this.callStartTime = Date.now();
+    this._setActiveIntercomSession({
+      ...sessionData,
+      target_client: sessionData.target_client || targets?.[0]?.clientId || targets?.[0]?.client_id || null,
+      target_name: sessionData.target_name || targets?.[0]?.name || null,
+      target_entity_id: sessionData.target_entity_id || targets?.[0]?.entity_id || targets?.[0]?.entityId || null,
+      media: sessionData.media || type,
+    }, this.roomId);
 
     try {
       this._cleanupMicProcessing();
@@ -1341,6 +1357,7 @@ class HaIntercomCard extends LitElement {
         this.outgoingMedia = null;
         this.clearMediaElements();
         console.error(`No media devices available or permissions denied: ${audioErr}`);
+        this._fireHaIntercomCallEnded('error');
         throw audioErr;
       }
     }
@@ -1361,7 +1378,7 @@ class HaIntercomCard extends LitElement {
     });
   }
 
-  async joinCall(roomId, type = 'audio') {
+  async joinCall(roomId, type = 'audio', sessionData = {}) {
     // If already connected (previewing), just need to start producing.
     let isUpgrade = false;
     if (this.roomId === roomId && this.device && this.device.loaded) {
@@ -1371,6 +1388,10 @@ class HaIntercomCard extends LitElement {
     this.roomId = roomId;
     this.roomState = 'in-call';
     this.callStartTime = Date.now();
+    this._setActiveIntercomSession({
+      ...sessionData,
+      media: sessionData.media || type,
+    }, roomId);
     try {
       this._cleanupMicProcessing();
       this.localStream = await this._prepareLocalStream(
@@ -1390,6 +1411,7 @@ class HaIntercomCard extends LitElement {
         this.outgoingMedia = { type: 'audio', to: this.incomingMedia?.from };
       } catch (audioErr) {
         console.error(`No media devices available or permissions denied: ${audioErr}`);
+        this._fireHaIntercomCallEnded('error');
         throw audioErr;
       }
     }
@@ -1513,10 +1535,76 @@ class HaIntercomCard extends LitElement {
     }
   }
 
-  hangUp() {
-    if (this.roomId) {
+  _setActiveIntercomSession(data = {}, roomId = this.roomId) {
+    this._activeIntercomSession = {
+      session_id: data.session_id || this._activeIntercomSession?.session_id || null,
+      room_id: roomId || data.room_id || this._activeIntercomSession?.room_id || null,
+      source: data.source || this._activeIntercomSession?.source || null,
+      target: data.target || this._activeIntercomSession?.target || null,
+      source_client: data.source_client || this._activeIntercomSession?.source_client || null,
+      target_client: data.target_client || this._activeIntercomSession?.target_client || null,
+      source_name: data.source_name || this._activeIntercomSession?.source_name || null,
+      target_name: data.target_name || this._activeIntercomSession?.target_name || null,
+      source_entity_id: data.source_entity_id || this._activeIntercomSession?.source_entity_id || null,
+      target_entity_id: data.target_entity_id || data.target_entity || this._activeIntercomSession?.target_entity_id || null,
+      mode: data.mode || this._activeIntercomSession?.mode || null,
+      media: data.media || this.mediaType || this._activeIntercomSession?.media || null,
+    };
+    this._callEndedEventFiredForKey = null;
+  }
+
+  _fireHaIntercomCallEnded(reason = 'unknown', details = {}) {
+    const connection = this._hass?.connection;
+    if (!connection) return;
+
+    const session = this._activeIntercomSession || {};
+    const roomId = details.roomId || this.roomId || session.room_id || this.incomingMedia?.roomId || null;
+    const eventKey = session.session_id || roomId;
+    if (eventKey && this._callEndedEventFiredForKey === eventKey) {
+      return;
+    }
+    if (eventKey) {
+      this._callEndedEventFiredForKey = eventKey;
+    }
+
+    const payload = {
+      type: 'fire_event',
+      event_type: 'ha_intercom_call_ended',
+      event_data: {
+        session_id: session.session_id || null,
+        room_id: roomId,
+        source: session.source || null,
+        target: session.target || null,
+        source_client: session.source_client || null,
+        target_client: session.target_client || null,
+        source_name: session.source_name || null,
+        target_name: session.target_name || null,
+        source_entity_id: session.source_entity_id || null,
+        target_entity_id: session.target_entity_id || null,
+        mode: session.mode || null,
+        media: session.media || this.mediaType || null,
+        reason,
+        timestamp: new Date().toISOString(),
+      },
+    };
+
+    try {
+      const send = typeof connection.sendMessagePromise === 'function'
+        ? connection.sendMessagePromise(payload)
+        : connection.sendMessage(payload);
+      Promise.resolve(send).catch((err) => {
+        console.warn('HA-Intercom: failed to fire call ended event', err);
+      });
+    } catch (err) {
+      console.warn('HA-Intercom: failed to fire call ended event', err);
+    }
+  }
+
+  hangUp(reason = 'local_hangup', options = {}) {
+    if (this.roomId && options.sendHangup !== false) {
       this.sendMessage({ type: 'hangup', roomId: this.roomId });
     }
+    this._fireHaIntercomCallEnded(reason, options);
     if (this.localStream) {
       this.localStream.getTracks().forEach(t => t.stop());
     }
@@ -1669,13 +1757,36 @@ class HaIntercomCard extends LitElement {
     });
   }
 
+  _configuredClientIdentity() {
+    const name = this.config?.name || this.config?.clientName;
+    const rawEntityId = this.config?.entity_id || this.config?.entityId;
+    if (!name || !rawEntityId) return null;
+    const entity_id = String(rawEntityId).startsWith('ha_intercom.')
+      ? String(rawEntityId)
+      : `ha_intercom.${rawEntityId}`;
+    return { name, entity_id };
+  }
+
+  _applyConfiguredClientIdentity(persist = false) {
+    const clientConfig = this._configuredClientIdentity();
+    if (!clientConfig) return false;
+    this.NAME = clientConfig.name;
+    this.ENTITY_ID = clientConfig.entity_id;
+    this.displaySetup = false;
+    if (persist && this.socket?.readyState === WebSocket.OPEN) {
+      this.sendMessage({ type: 'updateConfig', ...clientConfig });
+    }
+    this.requestUpdate();
+    return true;
+  }
+
 
   updateConfig(e) {
     e.preventDefault();
     const formData = new FormData(e.target);
     const allData = Object.fromEntries(formData.entries());
     let entity_id = `ha_intercom.${allData.entity_id}`;
-    this.socket?.send(this.sendMessage({ type: 'updateConfig', ...allData, entity_id }));
+    this.sendMessage({ type: 'updateConfig', ...allData, entity_id });
   }
 
   toggleConfig(open = undefined) {
@@ -1730,7 +1841,7 @@ class HaIntercomCard extends LitElement {
         </div>
       `;
     }
-    if (this.displaySetup) {
+    if (this.displaySetup && !this._applyConfiguredClientIdentity(false)) {
       return html`
         <form @submit=${this.updateConfig}>
           <h3>HA-Intercom Client Configuration</h3>
